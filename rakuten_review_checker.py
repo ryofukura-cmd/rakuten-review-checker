@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""楽天商品レビュー定期チェッカー"""
+"""楽天商品レビュー定期チェッカー（Playwright版）"""
 
 import os
 import json
@@ -7,10 +7,10 @@ import hashlib
 import time
 import re
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import gspread
+from playwright.sync_api import sync_playwright
 
 JST = ZoneInfo('Asia/Tokyo')
 
@@ -24,7 +24,7 @@ HEADERS = {
         'AppleWebKit/537.36 (KHTML, like Gecko) '
         'Chrome/124.0.0.0 Safari/537.36'
     ),
-    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    'Accept-Language': 'ja,en-US;q=0.9',
 }
 
 
@@ -40,32 +40,39 @@ def setup_gspread():
 
 
 def ensure_sheets(gc):
-    """シートが存在しない場合は自動作成"""
     sh = gc.open_by_key(SPREADSHEET_ID)
     existing = {ws.title for ws in sh.worksheets()}
 
     if '商品リスト' not in existing:
-        ws = sh.add_worksheet('商品リスト', rows=200, cols=3)
-        ws.update('A1:C1', [['商品名', '楽天商品URL', '監視(ON/OFF)']])
-        ws.format('A1:C1', {'textFormat': {'bold': True}})
+        ws = sh.add_worksheet('商品リスト', rows=200, cols=4)
+        ws.update('A1:D1', [['商品名', '商品URL（サムネ用）', 'レビューURL', '監視(ON/OFF)']])
+        ws.format('A1:D1', {'textFormat': {'bold': True}})
         print('シート「商品リスト」を作成しました')
 
     if '通知済み' not in existing:
         ws = sh.add_worksheet('通知済み', rows=5000, cols=3)
-        ws.update('A1:C1', [['商品URL', 'レビューハッシュ', '通知日時']])
+        ws.update('A1:C1', [['商品名', 'レビューハッシュ', '通知日時']])
         ws.format('A1:C1', {'textFormat': {'bold': True}})
         print('シート「通知済み」を作成しました')
 
 
 def load_products(gc):
     rows = gc.open_by_key(SPREADSHEET_ID).worksheet('商品リスト').get_all_values()
-    return [
-        {'name': r[0].strip(), 'url': r[1].strip()}
-        for r in rows[1:]
-        if len(r) >= 2
-        and r[1].strip()
-        and (len(r) < 3 or r[2].strip().upper() != 'OFF')
-    ]
+    products = []
+    for r in rows[1:]:
+        if not r or not r[0].strip():
+            continue
+        active = True
+        if len(r) >= 4 and r[3].strip().upper() == 'OFF':
+            active = False
+        if not active:
+            continue
+        products.append({
+            'name':        r[0].strip(),
+            'product_url': r[1].strip() if len(r) > 1 else '',
+            'review_url':  r[2].strip() if len(r) > 2 else '',
+        })
+    return products
 
 
 def load_notified(gc):
@@ -73,19 +80,15 @@ def load_notified(gc):
     return set(r[1] for r in rows[1:] if len(r) >= 2)
 
 
-def save_notified(gc, url, h):
+def save_notified(gc, product_name, h):
     gc.open_by_key(SPREADSHEET_ID).worksheet('通知済み').append_row(
-        [url, h, datetime.now(JST).strftime('%Y-%m-%d %H:%M')]
+        [product_name, h, datetime.now(JST).strftime('%Y-%m-%d %H:%M')]
     )
 
 
 # ── 時間ウィンドウ ────────────────────────────────────────────────
 
 def get_time_window():
-    """
-    9時  → 前日18:00〜当日09:00
-    10〜18時 → 直前1時間
-    """
     now  = datetime.now(JST)
     base = now.replace(minute=0, second=0, microsecond=0)
     if now.hour == 9:
@@ -95,25 +98,11 @@ def get_time_window():
     return start, base
 
 
-# ── スクレイピング ────────────────────────────────────────────────
-
-def parse_rakuten_url(url):
-    m = re.search(r'item\.rakuten\.co\.jp/([^/?#]+)/([^/?#]+)', url.rstrip('/'))
-    return (m.group(1), m.group(2)) if m else (None, None)
-
-
-def fetch_thumbnail(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        og = soup.find('meta', property='og:image')
-        return og['content'] if og else None
-    except Exception as e:
-        print(f'  サムネイル取得失敗: {e}')
-        return None
-
+# ── 日付パース ────────────────────────────────────────────────────
 
 def parse_date(text):
+    if not text:
+        return None
     m = re.search(
         r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日(?:[^\d]*(\d{1,2}):(\d{2}))?',
         text,
@@ -125,100 +114,147 @@ def parse_date(text):
     return datetime(y, mo, d, h, mi, tzinfo=JST)
 
 
-def scrape_reviews(shop_id, item_id, start_dt, end_dt, notified):
+# ── サムネイル取得 ────────────────────────────────────────────────
+
+def fetch_thumbnail(url):
+    if not url:
+        return None
+    try:
+        from bs4 import BeautifulSoup
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        og = soup.find('meta', property='og:image')
+        return og['content'] if og else None
+    except Exception as e:
+        print(f'  サムネイル取得失敗: {e}')
+        return None
+
+
+# ── レビュースクレイピング（Playwright） ──────────────────────────
+
+def build_review_url(review_url):
+    """sort=6（新着順）を付与"""
+    base = re.sub(r'[?#].*', '', review_url.rstrip('/'))
+    return f'{base}?sort=6'
+
+
+def scrape_reviews(review_url, start_dt, end_dt, notified):
     results = []
+    url = build_review_url(review_url)
+    print(f'  URL: {url}')
 
-    for page in range(1, 11):
-        url = f'https://review.rakuten.co.jp/item/1/{shop_id}.{item_id}/{page}/'
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+        context = browser.new_context(
+            user_agent=HEADERS['User-Agent'],
+            locale='ja-JP',
+        )
+        page = context.new_page()
+
         try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
-            if r.status_code == 404:
-                break
-            if r.status_code != 200:
-                print(f'  HTTP {r.status_code}')
-                break
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # ページが安定するまで少し待つ
+            time.sleep(3)
 
-            soup = BeautifulSoup(r.text, 'html.parser')
+            # レビュー要素を探す（複数セレクタで試行）
+            review_items = []
+            selectors = [
+                '[class*="review-item"]',
+                '[class*="reviewItem"]',
+                '[class*="ReviewItem"]',
+                '[class*="review_item"]',
+                'li[class*="review"]',
+                'article[class*="review"]',
+                '[data-review-id]',
+                '[class*="revRvw"]',
+            ]
 
-            # レビューブロックを探す（セレクタ優先順）
-            blocks = (
-                soup.select('.revRvwUserEntry')
-                or soup.select('[class*="revRvwUser"]')
-                or soup.select('.review-item')
-                or soup.select('[itemtype*="Review"]')
-            )
-            if not blocks:
-                print(f'  レビューブロック未検出 (p{page})')
-                break
-
-            stop = False
-            for b in blocks:
-                # 日付
-                dt_text = ''
-                for sel in ['.revDate', 'time', '[class*="date"]', '[class*="Date"]']:
-                    el = b.select_one(sel)
-                    if el:
-                        dt_text = el.get('datetime', '') or el.get_text(strip=True)
+            found_selector = None
+            for sel in selectors:
+                try:
+                    items = page.query_selector_all(sel)
+                    if items:
+                        review_items = items
+                        found_selector = sel
+                        print(f'  セレクタ「{sel}」で {len(items)} 件検出')
                         break
-                if not dt_text:
-                    m = re.search(r'\d{4}年\d{1,2}月\d{1,2}日', b.get_text())
-                    dt_text = m.group(0) if m else ''
-
-                rev_dt = parse_date(dt_text)
-                if not rev_dt:
-                    continue
-                if rev_dt < start_dt:
-                    stop = True
-                    break
-                if rev_dt >= end_dt:
+                except Exception:
                     continue
 
-                # レビュー本文
-                text = ''
-                for sel in ['.revComment', '[class*="comment"]', '[class*="Comment"]', 'p']:
-                    el = b.select_one(sel)
-                    if el and len(el.get_text(strip=True)) > 5:
-                        text = el.get_text(strip=True)
-                        break
-                if not text:
-                    continue
+            if not review_items:
+                # フォールバック: 日付パターンを含む要素を探す
+                print('  セレクタ未検出。テキストから日付を探します')
+                body = page.inner_text('body')
+                dates = re.findall(r'\d{4}年\d{1,2}月\d{1,2}日', body)
+                print(f'  本文中の日付: {dates[:5]}')
+                browser.close()
+                return []
 
-                # タイトル
-                title = ''
-                for sel in ['.revTitle', '[class*="title"]', '[class*="Title"]']:
-                    el = b.select_one(sel)
-                    if el:
-                        title = el.get_text(strip=True)
-                        break
+            for item in review_items:
+                try:
+                    full_text = item.inner_text()
 
-                # 評価（1〜5）
-                rating = 0
-                for sel in ['[class*="rating"]', '[class*="Rating"]', '[class*="star"]', '[itemprop="ratingValue"]']:
-                    el = b.select_one(sel)
-                    if el:
-                        val = el.get('content', '') or el.get_text()
-                        m = re.search(r'[1-5]', str(val))
+                    # 日付
+                    dt_text = ''
+                    for sel in ['[class*="date"]', '[class*="Date"]', 'time', '[class*="post"]']:
+                        el = item.query_selector(sel)
+                        if el:
+                            dt_text = el.get_attribute('datetime') or el.inner_text()
+                            if re.search(r'\d{4}年', dt_text):
+                                break
+                    if not dt_text:
+                        m = re.search(r'\d{4}年\d{1,2}月\d{1,2}日', full_text)
                         if m:
-                            rating = int(m.group(0))
-                            break
+                            dt_text = m.group(0)
 
-                h = hashlib.md5(f'{dt_text}{text}'.encode()).hexdigest()
-                if h not in notified:
-                    results.append({
-                        'date': dt_text,
-                        'title': title,
-                        'text': text,
-                        'rating': rating,
-                        'hash': h,
-                    })
+                    rev_dt = parse_date(dt_text)
+                    if not rev_dt:
+                        continue
 
-            if stop:
-                break
-            time.sleep(1)
+                    # 新着順なので古いレビューに達したら終了
+                    if rev_dt < start_dt:
+                        print(f'  {dt_text} は対象期間より古い → 終了')
+                        results = results  # 現在の結果を保持
+                        browser.close()
+                        return results
+
+                    if rev_dt >= end_dt:
+                        continue
+
+                    # レビュー本文（長い行を優先）
+                    lines = [l.strip() for l in full_text.split('\n') if len(l.strip()) > 15]
+                    text = lines[0] if lines else ''
+
+                    # 評価（数字）
+                    rating = 0
+                    for sel in ['[class*="rating"]', '[class*="star"]', '[aria-label*="点"]']:
+                        el = item.query_selector(sel)
+                        if el:
+                            aria = el.get_attribute('aria-label') or ''
+                            txt  = el.inner_text()
+                            m = re.search(r'([1-5])', aria + txt)
+                            if m:
+                                rating = int(m.group(1))
+                                break
+
+                    if not text:
+                        continue
+
+                    h = hashlib.md5(f'{dt_text}{text}'.encode()).hexdigest()
+                    if h not in notified:
+                        results.append({
+                            'date': dt_text, 'text': text,
+                            'rating': rating, 'hash': h,
+                        })
+
+                except Exception as e:
+                    print(f'  レビュー要素パースエラー: {e}')
+                    continue
 
         except Exception as e:
-            print(f'  取得エラー p{page}: {e}')
-            break
+            print(f'  ページ読み込みエラー: {e}')
+        finally:
+            browser.close()
 
     return results
 
@@ -226,15 +262,12 @@ def scrape_reviews(shop_id, item_id, start_dt, end_dt, notified):
 # ── Chatwork通知 ──────────────────────────────────────────────────
 
 def notify_chatwork(product_name, review, thumbnail_url):
-    stars = ('★' * review['rating'] + '☆' * (5 - review['rating'])) if review['rating'] else '未評価'
-    title_line = f"📝 {review['title']}\n" if review['title'] else ''
-
+    stars  = ('★' * review['rating'] + '☆' * (5 - review['rating'])) if review['rating'] else '未評価'
     msg = (
         f"[info][title]🛒 新しいレビューが届きました！[/title]"
         f"📦 商品：{product_name}\n"
         f"📅 投稿日：{review['date']}\n"
         f"⭐ 評価：{stars}\n"
-        f"{title_line}"
         f"💬 {review['text']}"
         f"[/info]"
     )
@@ -259,9 +292,7 @@ def notify_chatwork(product_name, review, thumbnail_url):
 
     requests.post(
         f'https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM}/messages',
-        headers=hdrs,
-        data={'body': msg},
-        timeout=30,
+        headers=hdrs, data={'body': msg}, timeout=30,
     )
 
 
@@ -269,7 +300,7 @@ def notify_chatwork(product_name, review, thumbnail_url):
 
 def main():
     start_dt, end_dt = get_time_window()
-    print(f'チェック期間: {start_dt:%Y-%m-%d %H:%M} ～ {end_dt:%Y-%m-%d %H:%M} JST')
+    print(f'チェック期間: {start_dt:%Y-%m-%d %H:%M} ～ {end_dt:%Y-%m-%d %H:%M} JST\n')
 
     gc = setup_gspread()
     ensure_sheets(gc)
@@ -279,16 +310,17 @@ def main():
     print(f'{len(products)} 商品を処理します\n')
 
     for p in products:
-        name, url = p['name'], p['url']
+        name        = p['name']
+        product_url = p['product_url']
+        review_url  = p['review_url']
         print(f'▶ {name}')
 
-        shop_id, item_id = parse_rakuten_url(url)
-        if not shop_id:
-            print('  URLパース失敗（item.rakuten.co.jp 形式のURLを確認してください）')
+        if not review_url:
+            print('  レビューURLが未設定（スプレッドシートのC列に入力してください）')
             continue
 
-        thumb   = fetch_thumbnail(url)
-        reviews = scrape_reviews(shop_id, item_id, start_dt, end_dt, notified)
+        thumb   = fetch_thumbnail(product_url)
+        reviews = scrape_reviews(review_url, start_dt, end_dt, notified)
 
         if not reviews:
             print('  新着レビューなし')
@@ -297,7 +329,7 @@ def main():
         print(f'  {len(reviews)} 件を通知')
         for rv in reviews:
             notify_chatwork(name, rv, thumb)
-            save_notified(gc, url, rv['hash'])
+            save_notified(gc, name, rv['hash'])
             notified.add(rv['hash'])
             time.sleep(0.5)
 
