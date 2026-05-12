@@ -89,8 +89,8 @@ def save_notified(gc, product_name, h):
 # ── チェック対象期間 ──────────────────────────────────────────────
 
 def get_check_since():
-    """過去2日分のレビューを対象にする（古いレビューの誤通知防止）"""
-    return datetime.now(JST) - timedelta(days=2)
+    """過去30日分のレビューを対象にする（テスト用・本番は2日に戻す）"""
+    return datetime.now(JST) - timedelta(days=30)
 
 
 # ── 日付パース ────────────────────────────────────────────────────
@@ -139,17 +139,37 @@ def scrape_reviews(review_url, since_dt, notified):
     print(f'  URL: {url}')
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--disable-infobars',
+            ]
+        )
         context = browser.new_context(
             user_agent=HEADERS['User-Agent'],
             locale='ja-JP',
+            viewport={'width': 1280, 'height': 800},
+            extra_http_headers={'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'},
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
 
         try:
-            page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            # ページが安定するまで少し待つ
-            time.sleep(3)
+            page.goto(url, wait_until='networkidle', timeout=60000)
+            time.sleep(5)
+
+            # デバッグ: ページ内容を確認
+            body_text = page.inner_text('body')
+            print(f'  ページ文字数: {len(body_text)}')
+            print(f'  ページ冒頭: {body_text[:300].replace(chr(10), " ")}')
+
+            dates_in_body = re.findall(r'\d{4}年\d{1,2}月\d{1,2}日', body_text)
+            print(f'  本文中の日付: {dates_in_body[:5]}')
 
             # レビュー要素を探す（複数セレクタで試行）
             review_items = []
@@ -162,6 +182,10 @@ def scrape_reviews(review_url, since_dt, notified):
                 'article[class*="review"]',
                 '[data-review-id]',
                 '[class*="revRvw"]',
+                '[class*="rvwItem"]',
+                '[class*="RvwItem"]',
+                'section[class*="review"]',
+                'div[class*="revEach"]',
             ]
 
             found_selector = None
@@ -177,11 +201,7 @@ def scrape_reviews(review_url, since_dt, notified):
                     continue
 
             if not review_items:
-                # フォールバック: 日付パターンを含む要素を探す
-                print('  セレクタ未検出。テキストから日付を探します')
-                body = page.inner_text('body')
-                dates = re.findall(r'\d{4}年\d{1,2}月\d{1,2}日', body)
-                print(f'  本文中の日付: {dates[:5]}')
+                print('  セレクタ未検出。日付ベースのパースも失敗しました')
                 browser.close()
                 return []
 
