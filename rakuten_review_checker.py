@@ -11,14 +11,12 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import gspread
-from google.oauth2.service_account import Credentials
 
 JST = ZoneInfo('Asia/Tokyo')
 
 CHATWORK_TOKEN = os.environ['CHATWORK_API_TOKEN']
 CHATWORK_ROOM  = os.environ.get('CHATWORK_ROOM_ID', '436382401')
 SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
-GOOGLE_CREDS   = os.environ['GOOGLE_CREDENTIALS_JSON']
 
 HEADERS = {
     'User-Agent': (
@@ -33,13 +31,11 @@ HEADERS = {
 # ── Google Sheets ──────────────────────────────────────────────────
 
 def setup_gspread():
-    creds = Credentials.from_service_account_info(
-        json.loads(GOOGLE_CREDS),
-        scopes=[
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive',
-        ],
-    )
+    import google.auth
+    creds, _ = google.auth.default(scopes=[
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive',
+    ])
     return gspread.authorize(creds)
 
 
