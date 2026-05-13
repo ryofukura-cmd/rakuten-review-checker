@@ -161,12 +161,25 @@ def scrape_reviews(review_url, since_dt, notified):
         decoder = json.JSONDecoder()
         data, _ = decoder.raw_decode(html, start)
 
-        item_reviews = data.get('reviews', {}).get('itemReviews', {})
-        print(f'  レビュー件数（全体）: {len(item_reviews)}')
+        print(f'  [DEBUG] top-level keys: {list(data.keys())[:10]}')
+        reviews_section = data.get('reviews', {})
+        print(f'  [DEBUG] reviews keys: {list(reviews_section.keys())[:15]}')
 
-        # デバッグ: itemReviews全体の構造を表示
-        for k, v in item_reviews.items():
-            print(f'  [DEBUG] itemReviews key={repr(k)}, val_type={type(v).__name__}, val_preview={repr(str(v)[:80])}')
+        item_reviews = reviews_section.get('itemReviews', {})
+        uuids = item_reviews.get('keys', [])
+        total = item_reviews.get('count', 0)
+        print(f'  レビュー件数（全体）: {total}, このページ: {len(uuids)}件')
+
+        # UUIDで実際のレビューデータを引く
+        # まずどこにレビューデータがあるか確認
+        first_uuid = uuids[0] if uuids else None
+        if first_uuid:
+            for top_key, top_val in data.items():
+                if isinstance(top_val, dict) and first_uuid in top_val:
+                    print(f'  [DEBUG] UUID found in data[{repr(top_key)}]')
+                    sample = top_val[first_uuid]
+                    print(f'  [DEBUG] sample keys: {list(sample.keys()) if isinstance(sample, dict) else type(sample).__name__}')
+                    break
 
         for key, rv in item_reviews.items():
             if not isinstance(rv, dict):
