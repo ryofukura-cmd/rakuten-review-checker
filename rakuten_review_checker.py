@@ -50,9 +50,9 @@ def ensure_sheets(gc):
         print('シート「商品リスト」を作成しました')
 
     if '通知済み' not in existing:
-        ws = sh.add_worksheet('通知済み', rows=5000, cols=3)
-        ws.update('A1:C1', [['商品名', 'レビューハッシュ', '通知日時']])
-        ws.format('A1:C1', {'textFormat': {'bold': True}})
+        ws = sh.add_worksheet('通知済み', rows=5000, cols=6)
+        ws.update('A1:F1', [['商品名', 'レビューハッシュ', '通知日時', 'レビュー日付', '評価', 'レビュー内容']])
+        ws.format('A1:F1', {'textFormat': {'bold': True}})
         print('シート「通知済み」を作成しました')
 
 
@@ -80,9 +80,11 @@ def load_notified(gc):
     return set(r[1] for r in rows[1:] if len(r) >= 2)
 
 
-def save_notified(gc, product_name, h):
+def save_notified(gc, product_name, h, review):
+    stars = ('★' * review['rating'] + '☆' * (5 - review['rating'])) if review.get('rating') else '未評価'
     gc.open_by_key(SPREADSHEET_ID).worksheet('通知済み').append_row(
-        [product_name, h, datetime.now(JST).strftime('%Y-%m-%d %H:%M')]
+        [product_name, h, datetime.now(JST).strftime('%Y-%m-%d %H:%M'),
+         review.get('date', ''), stars, review.get('text', '')]
     )
 
 
@@ -332,15 +334,17 @@ def notify_chatwork(product_name, review, thumbnail_url):
                     data={'message': msg},
                     timeout=30,
                 )
+                print(f'  Chatwork画像送信: {r.status_code}')
                 if r.status_code in (200, 201):
                     return
         except Exception as e:
             print(f'  画像送信失敗（テキストで送信）: {e}')
 
-    requests.post(
+    r = requests.post(
         f'https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM}/messages',
         headers=hdrs, data={'body': msg}, timeout=30,
     )
+    print(f'  Chatworkテキスト送信: {r.status_code} {r.text[:200]}')
 
 
 # ── メイン ────────────────────────────────────────────────────────
@@ -376,7 +380,7 @@ def main():
         print(f'  {len(reviews)} 件を通知')
         for rv in reviews:
             notify_chatwork(name, rv, thumb)
-            save_notified(gc, name, rv['hash'])
+            save_notified(gc, name, rv['hash'], rv)
             notified.add(rv['hash'])
             time.sleep(0.5)
 
