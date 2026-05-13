@@ -52,7 +52,7 @@ def ensure_sheets(gc):
         ws = sh.add_worksheet('通知済み', rows=5000, cols=10)
     else:
         ws = sh.worksheet('通知済み')
-    ws.update('A1:J1', [['商品名', 'レビュー日付', '評価', 'タイトル', '本文', '投稿者名', '性別', '年齢', '通知日時', 'レビューハッシュ']])
+    ws.update([['商品名', 'レビュー日付', '評価', 'タイトル', '本文', '投稿者名', '性別', '年齢', '通知日時', 'レビューハッシュ']], 'A1:J1')
     ws.format('A1:J1', {'textFormat': {'bold': True}})
     if '通知済み' not in existing:
         print('シート「通知済み」を作成しました')
@@ -99,7 +99,7 @@ def save_notified(gc, product_name, h, review):
 # ── チェック対象期間 ──────────────────────────────────────────────
 
 def get_check_since():
-    return datetime.now(JST) - timedelta(days=365)
+    return datetime.now(JST) - timedelta(days=9999)
 
 
 # ── 日付パース ────────────────────────────────────────────────────
