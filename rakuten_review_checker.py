@@ -164,6 +164,14 @@ def scrape_reviews(review_url, since_dt, notified):
         item_reviews = data.get('reviews', {}).get('itemReviews', {})
         print(f'  レビュー件数（全体）: {len(item_reviews)}')
 
+        # デバッグ: 最初のレビューの内容を表示
+        for i, (key, rv) in enumerate(item_reviews.items()):
+            if i == 0:
+                print(f'  [DEBUG] key={key}, type={type(rv).__name__}')
+                if isinstance(rv, dict):
+                    print(f'  [DEBUG] keys={list(rv.keys())}')
+                    print(f'  [DEBUG] postDate={rv.get("postDate")}, body={str(rv.get("body",""))[:30]}, title={str(rv.get("title",""))[:30]}')
+
         for key, rv in item_reviews.items():
             if not isinstance(rv, dict):
                 continue
