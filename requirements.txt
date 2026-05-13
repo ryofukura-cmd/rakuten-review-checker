@@ -2,5 +2,4 @@ requests
 beautifulsoup4
 gspread
 google-auth
-playwright
 tzdata
