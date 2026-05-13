@@ -133,10 +133,86 @@ def build_review_url(review_url):
     return f'{base}?sort=6'
 
 
+def _parse_review_json(data, since_dt, notified):
+    """楽天レビューAPIのJSONからレビューを抽出する"""
+    results = []
+    # レビュー一覧が入っているキーを再帰的に探す
+    def find_reviews(obj, depth=0):
+        if depth > 6:
+            return []
+        found = []
+        if isinstance(obj, list):
+            for item in obj:
+                found.extend(find_reviews(item, depth + 1))
+        elif isinstance(obj, dict):
+            # 日付っぽいキーがあればレビューアイテムの可能性
+            date_keys = [k for k in obj if re.search(r'date|Date|time|Time|포스트|日時', k)]
+            text_keys = [k for k in obj if re.search(r'text|body|comment|review|内容|口コミ', k, re.I)]
+            if date_keys and text_keys:
+                found.append(obj)
+            else:
+                for v in obj.values():
+                    found.extend(find_reviews(v, depth + 1))
+        return found
+
+    candidates = find_reviews(data)
+    print(f'    JSONレビュー候補: {len(candidates)} 件')
+
+    for item in candidates:
+        try:
+            # 日付
+            dt_text = ''
+            for k in item:
+                if re.search(r'date|Date|time|Time', k):
+                    val = str(item[k])
+                    if re.search(r'\d{4}年|\d{4}-\d{2}-\d{2}', val):
+                        dt_text = val
+                        break
+
+            # YYYY-MM-DD 形式を変換
+            if re.match(r'\d{4}-\d{2}-\d{2}', dt_text):
+                ymd = dt_text[:10].split('-')
+                dt_text = f'{ymd[0]}年{int(ymd[1])}月{int(ymd[2])}日'
+
+            rev_dt = parse_date(dt_text)
+            if not rev_dt:
+                continue
+            if rev_dt < since_dt:
+                continue
+
+            # 本文
+            text = ''
+            for k in item:
+                if re.search(r'text|body|comment|review|内容|口コミ', k, re.I):
+                    v = str(item[k]).strip()
+                    if len(v) > len(text):
+                        text = v
+            if not text:
+                continue
+
+            # 評価
+            rating = 0
+            for k in item:
+                if re.search(r'rating|score|star|評価|点', k, re.I):
+                    try:
+                        rating = int(float(str(item[k])))
+                    except Exception:
+                        pass
+
+            h = hashlib.md5(f'{dt_text}{text}'.encode()).hexdigest()
+            if h not in notified:
+                results.append({'date': dt_text, 'text': text, 'rating': rating, 'hash': h})
+        except Exception:
+            continue
+    return results
+
+
 def scrape_reviews(review_url, since_dt, notified):
     results = []
     url = build_review_url(review_url)
     print(f'  URL: {url}')
+
+    captured_jsons = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -145,13 +221,12 @@ def scrape_reviews(review_url, since_dt, notified):
                 '--no-sandbox',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
-                '--disable-infobars',
             ]
         )
         context = browser.new_context(
             user_agent=HEADERS['User-Agent'],
             locale='ja-JP',
-            viewport={'width': 1280, 'height': 800},
+            viewport={'width': 1280, 'height': 900},
             extra_http_headers={'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'},
         )
         context.add_init_script(
@@ -159,108 +234,69 @@ def scrape_reviews(review_url, since_dt, notified):
         )
         page = context.new_page()
 
+        # レビュー関連のJSONレスポンスをすべて捕捉
+        def on_response(response):
+            try:
+                if response.status != 200:
+                    return
+                ct = response.headers.get('content-type', '')
+                if 'json' not in ct:
+                    return
+                rurl = response.url
+                if any(kw in rurl for kw in ['review', 'Review', 'rvw', 'comment', 'rating']):
+                    body = response.json()
+                    captured_jsons.append({'url': rurl, 'data': body})
+                    print(f'  JSON捕捉: {rurl[:120]}')
+            except Exception:
+                pass
+
+        page.on('response', on_response)
+
         try:
-            page.goto(url, wait_until='networkidle', timeout=60000)
+            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            # スクロールしてAJAX読み込みを誘発
+            for i in range(8):
+                page.evaluate(f'window.scrollTo(0, {(i+1) * 400})')
+                time.sleep(1)
             time.sleep(5)
 
-            # デバッグ: ページ内容を確認
+            print(f'  捕捉JSON数: {len(captured_jsons)}')
+
+            # JSONから解析を試みる
+            for cj in captured_jsons:
+                r = _parse_review_json(cj['data'], since_dt, notified)
+                if r:
+                    results.extend(r)
+
+            if results:
+                browser.close()
+                return results
+
+            # フォールバック: HTML本文から日付パターン検索
             body_text = page.inner_text('body')
             print(f'  ページ文字数: {len(body_text)}')
-            print(f'  ページ冒頭: {body_text[:300].replace(chr(10), " ")}')
-
             dates_in_body = re.findall(r'\d{4}年\d{1,2}月\d{1,2}日', body_text)
             print(f'  本文中の日付: {dates_in_body[:5]}')
 
-            # レビュー要素を探す（複数セレクタで試行）
-            review_items = []
-            selectors = [
-                '[class*="review-item"]',
-                '[class*="reviewItem"]',
-                '[class*="ReviewItem"]',
-                '[class*="review_item"]',
-                'li[class*="review"]',
-                'article[class*="review"]',
-                '[data-review-id]',
-                '[class*="revRvw"]',
-                '[class*="rvwItem"]',
-                '[class*="RvwItem"]',
-                'section[class*="review"]',
-                'div[class*="revEach"]',
-            ]
-
-            found_selector = None
-            for sel in selectors:
-                try:
-                    items = page.query_selector_all(sel)
-                    if items:
-                        review_items = items
-                        found_selector = sel
-                        print(f'  セレクタ「{sel}」で {len(items)} 件検出')
-                        break
-                except Exception:
-                    continue
-
-            if not review_items:
-                print('  セレクタ未検出。日付ベースのパースも失敗しました')
+            if not dates_in_body:
+                print('  レビューデータ取得不可')
                 browser.close()
                 return []
 
-            for item in review_items:
-                try:
-                    full_text = item.inner_text()
-
-                    # 日付
-                    dt_text = ''
-                    for sel in ['[class*="date"]', '[class*="Date"]', 'time', '[class*="post"]']:
-                        el = item.query_selector(sel)
-                        if el:
-                            dt_text = el.get_attribute('datetime') or el.inner_text()
-                            if re.search(r'\d{4}年', dt_text):
-                                break
-                    if not dt_text:
-                        m = re.search(r'\d{4}年\d{1,2}月\d{1,2}日', full_text)
-                        if m:
-                            dt_text = m.group(0)
-
-                    rev_dt = parse_date(dt_text)
-                    if not rev_dt:
-                        continue
-
-                    # 新着順なので2日より古いレビューに達したら終了
-                    if rev_dt < since_dt:
-                        print(f'  {dt_text} は対象期間より古い → 終了')
-                        browser.close()
-                        return results
-
-                    # レビュー本文（長い行を優先）
-                    lines = [l.strip() for l in full_text.split('\n') if len(l.strip()) > 15]
-                    text = lines[0] if lines else ''
-
-                    # 評価（数字）
-                    rating = 0
-                    for sel in ['[class*="rating"]', '[class*="star"]', '[aria-label*="点"]']:
-                        el = item.query_selector(sel)
-                        if el:
-                            aria = el.get_attribute('aria-label') or ''
-                            txt  = el.inner_text()
-                            m = re.search(r'([1-5])', aria + txt)
-                            if m:
-                                rating = int(m.group(1))
-                                break
-
-                    if not text:
-                        continue
-
-                    h = hashlib.md5(f'{dt_text}{text}'.encode()).hexdigest()
-                    if h not in notified:
-                        results.append({
-                            'date': dt_text, 'text': text,
-                            'rating': rating, 'hash': h,
-                        })
-
-                except Exception as e:
-                    print(f'  レビュー要素パースエラー: {e}')
+            # 日付前後のテキストをレビューとして抽出
+            for m in re.finditer(r'(\d{4}年\d{1,2}月\d{1,2}日)', body_text):
+                dt_text = m.group(1)
+                rev_dt = parse_date(dt_text)
+                if not rev_dt or rev_dt < since_dt:
                     continue
+                snippet = body_text[m.start():m.start() + 300]
+                lines = [l.strip() for l in snippet.split('\n') if len(l.strip()) > 15]
+                text = lines[0] if lines else ''
+                if not text:
+                    continue
+                h = hashlib.md5(f'{dt_text}{text}'.encode()).hexdigest()
+                if h not in notified:
+                    results.append({'date': dt_text, 'text': text, 'rating': 0, 'hash': h})
 
         except Exception as e:
             print(f'  ページ読み込みエラー: {e}')
