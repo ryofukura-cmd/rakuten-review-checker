@@ -44,7 +44,7 @@ def ensure_sheets(gc):
 
     if '商品リスト' not in existing:
         ws = sh.add_worksheet('商品リスト', rows=200, cols=4)
-        ws.update('A1:D1', [['商品名', '商品URL（サムネ用）', 'レビューURL', '監視(ON/OFF)']])
+        ws.update([['商品名', '商品URL（サムネ用）', 'レビューURL', '監視(ON/OFF)']], 'A1:D1')
         ws.format('A1:D1', {'textFormat': {'bold': True}})
         print('シート「商品リスト」を作成しました')
 
@@ -99,7 +99,7 @@ def save_notified(gc, product_name, h, review):
 # ── チェック対象期間 ──────────────────────────────────────────────
 
 def get_check_since():
-    return datetime.now(JST) - timedelta(days=2)
+    return datetime.now(JST) - timedelta(days=9999)
 
 
 # ── 日付パース ────────────────────────────────────────────────────
@@ -113,43 +113,32 @@ def parse_date(text):
     return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=JST)
 
 
-# ── サムネイル取得 ────────────────────────────────────────────────
-
-def fetch_thumbnail(url):
-    if not url:
-        return None
-    try:
-        from bs4 import BeautifulSoup
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        og = soup.find('meta', property='og:image')
-        return og['content'] if og else None
-    except Exception as e:
-        print(f'  サムネイル取得失敗: {e}')
-        return None
-
-
 # ── レビュースクレイピング ─────────────────────────────────────────
 
-def build_review_url(review_url):
-    """ページ番号とsort=6（新着順）を付与"""
+def build_scrape_url(review_url):
+    """スクレイピング用URL（ページ番号 + sort=6）"""
     base = re.sub(r'[?#].*', '', review_url.rstrip('/'))
-    # /1/ が末尾にない場合は追加
     if not re.search(r'/\d+/?$', base):
         base = f'{base}/1'
     return f'{base}/?sort=6'
 
 
+def build_display_url(review_url):
+    """通知表示用URL（ページ番号なし + sort=6）"""
+    base = re.sub(r'[?#].*', '', review_url.rstrip('/'))
+    base = re.sub(r'/\d+$', '', base)
+    return f'{base}?sort=6'
+
+
 def scrape_reviews(review_url, since_dt, notified):
     results = []
-    url = build_review_url(review_url)
+    url = build_scrape_url(review_url)
     print(f'  URL: {url}')
 
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         html = resp.text
 
-        # window.__INITIAL_STATE__ を抽出
         m = re.search(r'window\.__INITIAL_STATE__\s*=\s*', html)
         if not m:
             print('  __INITIAL_STATE__ が見つかりません')
@@ -173,7 +162,6 @@ def scrape_reviews(review_url, since_dt, notified):
             if not isinstance(rv, dict):
                 continue
 
-            # 日付（YYYY/MM/DD 形式）
             post_date = rv.get('postDate', '')
             dm = re.match(r'(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', post_date)
             if not dm:
@@ -188,13 +176,13 @@ def scrape_reviews(review_url, since_dt, notified):
             if not body and not title:
                 continue
 
-            rating        = rv.get('rating', 0)
-            nickname      = rv.get('nickname', '')
-            sex           = rv.get('sex', '')
-            gender        = {'male': '男性', 'female': '女性'}.get(sex, sex)
-            age_range     = str(rv.get('ageRange', ''))
-            age_suffix    = rv.get('ageSuffix', '代')
-            age           = f'{age_range}{age_suffix}' if age_range else ''
+            rating     = rv.get('rating', 0)
+            nickname   = rv.get('nickname', '')
+            sex        = rv.get('sex', '')
+            gender     = {'male': '男性', 'female': '女性'}.get(sex, sex)
+            age_range  = str(rv.get('ageRange', ''))
+            age_suffix = rv.get('ageSuffix', '代')
+            age        = f'{age_range}{age_suffix}' if age_range else ''
 
             h = hashlib.md5(f'{dt_text}{body or title}'.encode()).hexdigest()
             if h not in notified:
@@ -215,72 +203,81 @@ def scrape_reviews(review_url, since_dt, notified):
     return results
 
 
-# ── Chatwork通知 ──────────────────────────────────────────────────
+# ── Chatwork通知（全商品まとめて1通）────────────────────────────────
 
-def notify_chatwork(product_name, review, thumbnail_url, review_url=''):
-    rating = review.get('rating', 0)
-    stars  = '★' * rating + '☆' * (5 - rating)
-    title  = review.get('title', '')
-    body   = review.get('body', '')
+def build_message(product_reviews):
+    """
+    product_reviews: [{'name': str, 'display_url': str, 'reviews': [...]}, ...]
+    """
+    SEP = '━━━━━━━━━━━━━━━━━━'
+    total = sum(len(p['reviews']) for p in product_reviews)
 
-    lines = [
-        '【楽天市場レビュー通知】',
-        '\\お客様よりレビューをいただきました/',
-        '',
-        '■ 商品名',
-        product_name,
-        '',
-        '■ レビュー点数',
-        f'{stars}{rating} / 5',
-    ]
-    if title:
-        lines += ['', '■ レビュータイトル文', title]
+    lines = [f'[info][title]【楽天市場レビュー通知】新しいレビューが {total}件 届きました[/title]', '']
+    lines += ['\\ お客様よりレビューをいただきました /', '']
 
-    reviewer_name = review.get('reviewer_name', '')
-    gender        = review.get('gender', '')
-    age           = review.get('age', '')
-    if reviewer_name:
-        profile = f'{reviewer_name} 様'
-        if gender or age:
-            profile += f'（{gender}・{age}）' if gender and age else f'（{gender or age}）'
-        lines += ['', '■ 投稿者情報', profile]
+    # 全体サマリー
+    lines += [SEP, '【全体】', SEP, '']
+    lines.append('■ 対象商品')
+    for p in product_reviews:
+        lines.append(f'・{p["name"]}：{len(p["reviews"])}件')
+    lines.append('')
 
-    lines += [
-        '',
-        '■ レビュー本文',
-        body,
-        '',
-        '――――――――――',
-        '',
-        '詳細はレビューページをご確認ください',
-        review_url,
-    ]
-    msg = '\n'.join(lines)
+    rating_count = {}
+    for p in product_reviews:
+        for rv in p['reviews']:
+            r = rv.get('rating', 0)
+            rating_count[r] = rating_count.get(r, 0) + 1
 
+    lines.append('■ 評価内訳')
+    for r in sorted(rating_count.keys(), reverse=True):
+        stars = '★' * r + '☆' * (5 - r)
+        lines.append(f'{stars}：{rating_count[r]}件')
+    lines.append('')
+
+    # 商品別レビュー
+    for p in product_reviews:
+        lines += [SEP, f'【{p["name"]}】', SEP, '']
+
+        for rv in p['reviews']:
+            rating = rv.get('rating', 0)
+            stars  = '★' * rating + '☆' * (5 - rating)
+            lines.append(f'{stars} {rating} / 5')
+
+            name   = rv.get('reviewer_name', '')
+            gender = rv.get('gender', '')
+            age    = rv.get('age', '')
+            if name:
+                profile = f'{name} 様'
+                parts = [x for x in [gender, age] if x]
+                if parts:
+                    profile += f'（{"・".join(parts)}）'
+            else:
+                profile = '購入者様'
+            lines.append(profile)
+
+            title = rv.get('title', '')
+            body  = rv.get('body', '')
+            if title:
+                lines.append(f'『{title}』')
+            if body:
+                lines.append(f'「{body}」')
+            lines.append('')
+
+        lines += ['詳細はこちら', p['display_url'], '']
+
+    lines += ['――――――――――', '[/info]']
+    return '\n'.join(lines)
+
+
+def notify_chatwork(product_reviews):
+    msg  = build_message(product_reviews)
     hdrs = {'X-ChatWorkToken': CHATWORK_TOKEN}
-
-    if thumbnail_url:
-        try:
-            img = requests.get(thumbnail_url, headers=HEADERS, timeout=20)
-            if img.status_code == 200:
-                r = requests.post(
-                    f'https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM}/files',
-                    headers=hdrs,
-                    files={'file': ('thumbnail.jpg', img.content, 'image/jpeg')},
-                    data={'message': msg},
-                    timeout=30,
-                )
-                print(f'  Chatwork画像送信: {r.status_code}')
-                if r.status_code in (200, 201):
-                    return
-        except Exception as e:
-            print(f'  画像送信失敗（テキストで送信）: {e}')
-
     r = requests.post(
         f'https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM}/messages',
         headers=hdrs, data={'body': msg}, timeout=30,
     )
-    print(f'  Chatworkテキスト送信: {r.status_code} {r.text[:200]}')
+    print(f'  Chatwork送信: {r.status_code} {r.text[:200]}')
+    return r.status_code in (200, 201)
 
 
 # ── メイン ────────────────────────────────────────────────────────
@@ -296,29 +293,43 @@ def main():
     notified = load_notified(gc)
     print(f'{len(products)} 商品を処理します\n')
 
+    product_reviews = []
+
     for p in products:
-        name        = p['name']
-        product_url = p['product_url']
-        review_url  = p['review_url']
+        name       = p['name']
+        review_url = p['review_url']
         print(f'▶ {name}')
 
         if not review_url:
             print('  レビューURLが未設定（スプレッドシートのC列に入力してください）')
             continue
 
-        thumb   = fetch_thumbnail(product_url)
         reviews = scrape_reviews(review_url, since_dt, notified)
 
         if not reviews:
             print('  新着レビューなし')
             continue
 
-        print(f'  {len(reviews)} 件を通知')
-        for rv in reviews:
-            notify_chatwork(name, rv, thumb, review_url)
-            save_notified(gc, name, rv['hash'], rv)
-            notified.add(rv['hash'])
-            time.sleep(0.5)
+        print(f'  {len(reviews)} 件の新着レビュー')
+        product_reviews.append({
+            'name':        name,
+            'display_url': build_display_url(review_url),
+            'reviews':     reviews,
+        })
+
+    if product_reviews:
+        total = sum(len(p['reviews']) for p in product_reviews)
+        print(f'\n合計 {total} 件を通知送信中...')
+        notify_chatwork(product_reviews)
+
+        print('スプレッドシートに記録中...')
+        for p in product_reviews:
+            for rv in p['reviews']:
+                save_notified(gc, p['name'], rv['hash'], rv)
+                notified.add(rv['hash'])
+                time.sleep(1)
+    else:
+        print('\n新着レビューなし')
 
     print('\n✅ 完了')
 
