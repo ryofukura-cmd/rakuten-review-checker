@@ -51,8 +51,11 @@ def ensure_sheets(gc):
 
     if '通知済み' not in existing:
         ws = sh.add_worksheet('通知済み', rows=5000, cols=10)
-        ws.update('A1:J1', [['商品名', 'レビュー日付', '評価', 'タイトル', '本文', '投稿者名', '性別', '年齢', '通知日時', 'レビューハッシュ']])
-        ws.format('A1:J1', {'textFormat': {'bold': True}})
+    else:
+        ws = sh.worksheet('通知済み')
+    ws.update('A1:J1', [['商品名', 'レビュー日付', '評価', 'タイトル', '本文', '投稿者名', '性別', '年齢', '通知日時', 'レビューハッシュ']])
+    ws.format('A1:J1', {'textFormat': {'bold': True}})
+    if '通知済み' not in existing:
         print('シート「通知済み」を作成しました')
 
 
