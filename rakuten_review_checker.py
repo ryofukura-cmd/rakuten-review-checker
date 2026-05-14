@@ -210,7 +210,7 @@ def scrape_reviews(review_url, since_dt, notified):
                 continue
 
             rating     = rv.get('rating', 0)
-            nickname   = rv.get('nickname', '')
+            nickname   = re.sub(r'さん$', '', rv.get('nickname', '')).strip()
             sex        = rv.get('sex', '')
             gender     = {'male': '男性', 'female': '女性'}.get(sex, sex)
             age_range  = str(rv.get('ageRange', ''))
