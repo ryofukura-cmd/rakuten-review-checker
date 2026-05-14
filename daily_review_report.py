@@ -133,7 +133,44 @@ def is_business_day():
 # ── チェック対象期間 ──────────────────────────────────────────────
 
 def get_check_since():
-    return datetime.now(JST) - timedelta(days=2)
+    """
+    通常は3日前の0時から。
+    大型連休（祝日・年末年始・お盆を含む3日以上の連続非稼働日）明けは
+    連休中のレビューを無視し、稼働再開当日の0時から確認する。
+    """
+    import jpholiday
+
+    def is_off_day(d):
+        if d.weekday() >= 5:
+            return True
+        if jpholiday.is_holiday(d):
+            return True
+        if (d.month == 12 and d.day >= 28) or (d.month == 1 and d.day <= 4):
+            return True
+        if d.month == 8 and 10 <= d.day <= 16:
+            return True
+        return False
+
+    today = datetime.now(JST).date()
+
+    # 昨日から遡って連続する非稼働日を数える
+    d = today - timedelta(days=1)
+    consecutive_off = 0
+    for _ in range(14):
+        if is_off_day(d):
+            consecutive_off += 1
+            d -= timedelta(days=1)
+        else:
+            break
+
+    if consecutive_off >= 3:
+        # 大型連休明け：連休中データを無視して当日0時から
+        since_date = today
+    else:
+        # 通常 or 週末明け：3日前の0時から（金曜のデータを月曜にも取得）
+        since_date = today - timedelta(days=3)
+
+    return datetime(since_date.year, since_date.month, since_date.day, 0, 0, tzinfo=JST)
 
 
 # ── 日付パース ────────────────────────────────────────────────────
