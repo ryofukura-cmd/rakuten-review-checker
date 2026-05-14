@@ -269,8 +269,10 @@ def main():
         print(f'本日（{today:%Y-%m-%d}）は稼働対象外のためスキップします')
         return
 
-    since_dt = datetime.now(JST) - timedelta(hours=2)
-    print(f'チェック対象: {since_dt:%Y-%m-%d %H:%M} 以降の低評価（★1-2）レビュー\n')
+    # テスト用：30日遡り・最大3件で動作確認
+    TEST_MODE = True
+    since_dt = datetime.now(JST) - timedelta(days=30 if TEST_MODE else 0, hours=0 if TEST_MODE else 2)
+    print(f'チェック対象: {since_dt:%Y-%m-%d %H:%M} 以降の低評価（★1-2）レビュー{"【テストモード】" if TEST_MODE else ""}\n')
 
     gc       = setup_gspread()
     ws_alert = ensure_alert_sheet(gc)
@@ -280,6 +282,9 @@ def main():
 
     total_sent = 0
     for p in products:
+        if TEST_MODE and total_sent >= 3:
+            break
+
         name       = p['name']
         review_url = p['review_url']
         print(f'▶ {name}')
@@ -296,6 +301,8 @@ def main():
 
         display_url = build_display_url(review_url)
         for rv in reviews:
+            if TEST_MODE and total_sent >= 3:
+                break
             print(f'  ★{rv["rating"]} 検出 → 通知送信')
             if notify_chatwork(name, rv, display_url):
                 save_notified(ws_alert, name, rv)
