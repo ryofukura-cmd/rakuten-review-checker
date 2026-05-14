@@ -270,8 +270,8 @@ def main():
         print(f'本日（{today:%Y-%m-%d}）は稼働対象外のためスキップします')
         return
 
-    since_dt = datetime.now(JST) - timedelta(days=30)  # TEST
-    print(f'チェック対象: {since_dt:%Y-%m-%d %H:%M} 以降の低評価（★1-2）レビュー【テスト】\n')
+    since_dt = datetime.now(JST) - timedelta(hours=2)
+    print(f'チェック対象: {since_dt:%Y-%m-%d %H:%M} 以降の低評価（★1-2）レビュー\n')
 
     gc       = setup_gspread()
     ws_alert = ensure_alert_sheet(gc)
@@ -281,8 +281,6 @@ def main():
 
     total_sent = 0
     for p in products:
-        if total_sent >= 3:  # TEST上限
-            break
         name       = p['name']
         review_url = p['review_url']
         print(f'▶ {name}')
